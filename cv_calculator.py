@@ -1,14 +1,24 @@
 """
-Scoring engine applying Chen Auto Debating CV rules.
+Scoring calculator implementing the Chen Auto CV Algorithm.
 """
 from typing import List, Dict
 from config import SPEAKING_POINTS_TABLE
 from database import get_connection
-from name_matcher import normalize_name
+from name_matcher import get_name_variations
 
 class ChenCVCalculator:
     @staticmethod
-    def map_team_rank_to_stage(rank: int) -> str:
+    def map_team_rank_to_stage(rank: int, format_type: str = "BP") -> str:
+        if format_type in ["Australs", "AP", "World Schools", "WS"]:
+            if rank == 1: return "Win"
+            if rank == 2: return "GF"
+            if rank <= 4: return "SF"
+            if rank <= 8: return "QF"
+            if rank <= 16: return "OF"
+            if rank <= 32: return "DOF"
+            return "QOF"
+        
+        # Standard BP
         if rank == 1: return "Win"
         if rank <= 4: return "GF"
         if rank <= 8: return "SF"
@@ -18,7 +28,17 @@ class ChenCVCalculator:
         return "QOF"
 
     @staticmethod
-    def map_speaker_rank_to_stage(rank: int) -> str:
+    def map_speaker_rank_to_stage(rank: int, format_type: str = "BP") -> str:
+        if format_type in ["Australs", "AP", "World Schools", "WS"]:
+            if rank <= 3: return "Win"
+            if rank <= 6: return "GF"
+            if rank <= 12: return "SF"
+            if rank <= 24: return "QF"
+            if rank <= 48: return "OF"
+            if rank <= 96: return "DOF"
+            return "QOF"
+
+        # Standard BP
         if rank <= 2: return "Win"
         if rank <= 8: return "GF"
         if rank <= 16: return "SF"
@@ -29,13 +49,15 @@ class ChenCVCalculator:
 
     @classmethod
     def calculate_speaking_cv(cls, participant_names: List[str]) -> Dict:
-        norm_names = {normalize_name(n) for n in participant_names if normalize_name(n)}
+        norm_keys = set()
+        for n in participant_names:
+            norm_keys.update(get_name_variations(n))
+
         conn = get_connection()
         cur = conn.cursor()
 
-        # Find matching participant IDs
-        placeholders = ",".join("?" * len(norm_names))
-        cur.execute(f"SELECT id, raw_name FROM participants WHERE normalized_name IN ({placeholders})", list(norm_names))
+        placeholders = ",".join("?" * len(norm_keys))
+        cur.execute(f"SELECT id, raw_name FROM participants WHERE normalized_name IN ({placeholders})", list(norm_keys))
         p_rows = cur.fetchall()
 
         if not p_rows:
@@ -45,9 +67,8 @@ class ChenCVCalculator:
         p_ids = [r[0] for r in p_rows]
         p_placeholders = ",".join("?" * len(p_ids))
 
-        # Query attended tournaments
         query = f"""
-        SELECT DISTINCT t.id, t.slug, t.name, t.speaking_class, t.is_prm
+        SELECT DISTINCT t.id, t.slug, t.name, t.speaking_class, t.format, t.is_prm
         FROM tournaments t
         JOIN team_members tm ON t.id = tm.tournament_id
         WHERE tm.participant_id IN ({p_placeholders})
@@ -58,10 +79,9 @@ class ChenCVCalculator:
         raw_achievements = []
         breakdown = []
 
-        for t_id, slug, t_name, s_class, is_prm in tournaments:
+        for t_id, slug, t_name, s_class, fmt, is_prm in tournaments:
             prm_bonus = 0.4 if is_prm else 0.0
 
-            # Pro-Am Check
             cur.execute(f"""
                 SELECT tm.team_name, tm.avg_speaks
                 FROM team_members tm
@@ -86,7 +106,7 @@ class ChenCVCalculator:
                     elif diff >= 1.01:           team_adj, spk_adj = +0.4, 0.0
                     elif 0.75 <= diff <= 1.00:   team_adj, spk_adj = +0.2, 0.0
 
-            # 1. Furthest Outround (Open category)
+            # 1. Furthest Open Outround
             outround_desc = "None"
             if team_name:
                 cur.execute("SELECT stage FROM outrounds WHERE tournament_id = ? AND team_name = ? AND is_open = 1", (t_id, team_name))
@@ -98,24 +118,24 @@ class ChenCVCalculator:
                     outround_desc = f"{stage} ({pts:.2f} pts)"
                     raw_achievements.append(pts)
 
-            # 2. Team Tab
+            # 2. Team Tab (Top 50% check)
             team_tab_desc = "None"
             if team_name:
                 cur.execute("SELECT team_rank, total_teams, is_eligible FROM team_tab WHERE tournament_id = ? AND team_name = ?", (t_id, team_name))
                 tt_row = cur.fetchone()
                 if tt_row and tt_row[2] == 1:
-                    stage = cls.map_team_rank_to_stage(tt_row[0])
+                    stage = cls.map_team_rank_to_stage(tt_row[0], fmt)
                     base_pts = SPEAKING_POINTS_TABLE.get(s_class, {}).get(stage, 0.0)
                     pts = max(0.0, base_pts + prm_bonus + team_adj)
                     team_tab_desc = f"Rank {tt_row[0]}/{tt_row[1]} -> {stage} ({pts:.2f} pts)"
                     raw_achievements.append(pts)
 
-            # 3. Speaker Tab
+            # 3. Speaker Tab (Top 50% check)
             spk_tab_desc = "None"
             cur.execute(f"SELECT speaker_rank, total_speakers, is_eligible FROM speaker_tab WHERE tournament_id = ? AND participant_id IN ({p_placeholders})", [t_id] + p_ids)
             st_row = cur.fetchone()
             if st_row and st_row[2] == 1:
-                stage = cls.map_speaker_rank_to_stage(st_row[0])
+                stage = cls.map_speaker_rank_to_stage(st_row[0], fmt)
                 base_pts = SPEAKING_POINTS_TABLE.get(s_class, {}).get(stage, 0.0)
                 pts = max(0.0, base_pts + prm_bonus + spk_adj)
                 spk_tab_desc = f"Rank {st_row[0]}/{st_row[1]} -> {stage} ({pts:.2f} pts)"
@@ -130,7 +150,7 @@ class ChenCVCalculator:
                 "speaker_tab": spk_tab_desc
             })
 
-        # Savings Provisions (Ghost Copies: -0.8 standard steps)
+        # Savings Provisions: Ghost Copies (-0.8 pts step)
         pool = list(raw_achievements)
         for pts in raw_achievements:
             ghost = pts - 0.8
@@ -145,8 +165,8 @@ class ChenCVCalculator:
         conn.close()
 
         return {
-            "matched_names": [r[1] for r in p_rows],
+            "matched_names": list({r[1] for r in p_rows}),
             "tournaments": breakdown,
-            "top_10_speaking_achievements": top_10,
+            "top_10_achievements": top_10,
             "speaking_cv_score": cv_score
         }
